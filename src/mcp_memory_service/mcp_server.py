@@ -358,7 +358,8 @@ async def store_memory(
 async def retrieve_memory(
     query: str,
     ctx: Context,
-    n_results: int = 5
+    n_results: int = 5,
+    project: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Retrieve memories based on semantic similarity to a query.
@@ -366,15 +367,24 @@ async def retrieve_memory(
     Args:
         query: Search query for semantic similarity
         n_results: Maximum number of results to return
+        project: Optional project name to filter results. When specified, only
+                 memories tagged with 'project:{name}' will be returned.
 
     Returns:
         Dictionary with retrieved memories and metadata
     """
+    # Build tags filter if project is specified
+    # Project filtering uses the 'project:{name}' tag convention
+    tags = None
+    if project:
+        tags = [f"project:{project}"]
+
     # Delegate to shared MemoryService business logic
     memory_service = ctx.request_context.lifespan_context.memory_service
     return await memory_service.retrieve_memories(
         query=query,
-        n_results=n_results
+        n_results=n_results,
+        tags=tags
     )
 
 @mcp.tool()

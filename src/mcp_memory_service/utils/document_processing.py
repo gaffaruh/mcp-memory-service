@@ -70,6 +70,17 @@ def create_memory_from_chunk(
             chunk_tags = [tag.strip() for tag in chunk_tags.split(',') if tag.strip()]
         all_tags.extend(chunk_tags)
 
+    # Auto-add file: and path: tags from metadata for consistency with watcher
+    if chunk.metadata:
+        source_path = chunk.metadata.get('source_file') or chunk.metadata.get('source')
+        if source_path:
+            from pathlib import Path
+            path_obj = Path(source_path)
+            if not any(t.startswith('file:') for t in all_tags):
+                all_tags.append(f"file:{path_obj.name}")
+            if not any(t.startswith('path:') for t in all_tags):
+                all_tags.append(f"path:{source_path}")
+
     # Prepare metadata
     chunk_metadata = chunk.metadata.copy() if chunk.metadata else {}
     if extra_metadata:

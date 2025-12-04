@@ -408,20 +408,23 @@ class MemoryService:
             filtered_memories = memories
             if tags or memory_type:
                 filtered_memories = []
-                for memory in memories:
+                for memory_result in memories:
+                    # memory_result is a MemoryQueryResult, access the Memory object via .memory
+                    mem = memory_result.memory
+
                     # Filter by tags if specified
                     if tags:
-                        memory_tags = memory.metadata.get('tags', []) if hasattr(memory, 'metadata') else []
+                        memory_tags = mem.tags if hasattr(mem, 'tags') else []
                         if not any(tag in memory_tags for tag in tags):
                             continue
 
                     # Filter by memory_type if specified
                     if memory_type:
-                        mem_type = memory.metadata.get('memory_type', '') if hasattr(memory, 'metadata') else ''
+                        mem_type = mem.memory_type if hasattr(mem, 'memory_type') else ''
                         if mem_type != memory_type:
                             continue
 
-                    filtered_memories.append(memory)
+                    filtered_memories.append(memory_result)
 
             results = []
             for result in filtered_memories:
