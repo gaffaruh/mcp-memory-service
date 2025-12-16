@@ -1093,6 +1093,130 @@ SOLUTIONS:
             logger.error(traceback.format_exc())
             return []
 
+    async def search_by_tags_hybrid(
+        self,
+        tags: List[str],
+        time_start: Optional[float] = None,
+        time_end: Optional[float] = None,
+        limit: Optional[int] = None
+    ) -> List[Memory]:
+        """
+        Search memories with hybrid AND/OR tag logic based on tag type.
+
+        This method implements intelligent tag classification:
+        - Required tags (AND logic): project:*, file:* - must ALL match
+        - Optional tags (OR logic): all other tags - at least ONE must match
+
+        Query pattern: WHERE (required1 AND required2 AND ...) AND (optional1 OR optional2 OR ...)
+
+        This design supports both:
+        - Claude Code (through hooks that can preprocess tags)
+        - Codex (direct MCP calls with smart defaults)
+
+        Args:
+            tags: List of tags to search for (auto-classified by prefix)
+            time_start: Optional start timestamp filter
+            time_end: Optional end timestamp filter
+            limit: Optional maximum results to return
+
+        Returns:
+            List of Memory objects matching the hybrid criteria
+        """
+        try:
+            if not self.conn:
+                logger.error("Database not initialized")
+                return []
+
+            if not tags:
+                return []
+
+            # Classify tags into required (AND) and optional (OR)
+            # Required prefixes: project:, file:
+            required_prefixes = ('project:', 'file:')
+            required_tags = [t for t in tags if t.startswith(required_prefixes)]
+            optional_tags = [t for t in tags if not t.startswith(required_prefixes)]
+
+            logger.debug(f"Hybrid search - Required tags (AND): {required_tags}, Optional tags (OR): {optional_tags}")
+
+            # Build WHERE clause components
+            where_conditions = []
+            params = []
+
+            # Required tags: ALL must match (AND)
+            if required_tags:
+                required_conditions = " AND ".join(["tags LIKE ?" for _ in required_tags])
+                where_conditions.append(f"({required_conditions})")
+                params.extend([f"%{tag}%" for tag in required_tags])
+
+            # Optional tags: at least ONE must match (OR)
+            if optional_tags:
+                optional_conditions = " OR ".join(["tags LIKE ?" for _ in optional_tags])
+                where_conditions.append(f"({optional_conditions})")
+                params.extend([f"%{tag}%" for tag in optional_tags])
+
+            # Time filters
+            if time_start is not None:
+                where_conditions.append("created_at >= ?")
+                params.append(time_start)
+            if time_end is not None:
+                where_conditions.append("created_at <= ?")
+                params.append(time_end)
+
+            # Combine all conditions with AND
+            where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+
+            # Build limit clause
+            limit_clause = f"LIMIT {limit}" if limit is not None else ""
+
+            query = f'''
+                SELECT content_hash, content, tags, memory_type, metadata,
+                       created_at, updated_at, created_at_iso, updated_at_iso
+                FROM memories
+                {where_clause}
+                ORDER BY updated_at DESC
+                {limit_clause}
+            '''
+
+            logger.debug(f"Hybrid search query: {query}")
+            logger.debug(f"Hybrid search params: {params}")
+
+            cursor = self.conn.execute(query, params)
+
+            results = []
+            for row in cursor.fetchall():
+                try:
+                    content_hash, content, tags_str, memory_type, metadata_str, created_at, updated_at, created_at_iso, updated_at_iso = row
+
+                    # Parse tags and metadata
+                    memory_tags = [tag.strip() for tag in tags_str.split(",") if tag.strip()] if tags_str else []
+                    metadata = self._safe_json_loads(metadata_str, "memory_metadata")
+
+                    memory = Memory(
+                        content=content,
+                        content_hash=content_hash,
+                        tags=memory_tags,
+                        memory_type=memory_type,
+                        metadata=metadata,
+                        created_at=created_at,
+                        updated_at=updated_at,
+                        created_at_iso=created_at_iso,
+                        updated_at_iso=updated_at_iso
+                    )
+
+                    results.append(memory)
+
+                except Exception as parse_error:
+                    logger.warning(f"Failed to parse memory result: {parse_error}")
+                    continue
+
+            logger.info(f"Hybrid search found {len(results)} memories (required: {len(required_tags)} AND, optional: {len(optional_tags)} OR)")
+            return results
+
+        except Exception as e:
+            logger.error(f"Failed hybrid tag search: {str(e)}")
+            logger.error(traceback.format_exc())
+            return []
+
     async def search_by_tag_chronological(self, tags: List[str], limit: int = None, offset: int = 0) -> List[Memory]:
         """
         Search memories by tags with chronological ordering and database-level pagination.

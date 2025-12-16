@@ -391,23 +391,60 @@ async def retrieve_memory(
 async def search_by_tag(
     tags: Union[str, List[str]],
     ctx: Context,
-    match_all: bool = False
+    match_all: bool = False,
+    include_body: bool = True,
+    max_tokens: int = 0,
+    use_hybrid: bool = True
 ) -> Dict[str, Any]:
     """
-    Search memories by tags.
+    Search memories by tags with intelligent hybrid AND/OR logic.
+
+    **Hybrid Mode (default, use_hybrid=True):**
+    When tags contain both required prefixes (project:, file:) and other tags,
+    automatically applies smart query logic:
+    - Required tags (project:*, file:*): ALL must match (AND logic)
+    - Optional tags (category:*, topic:*, etc.): At least ONE must match (OR logic)
+
+    Query pattern: WHERE (project:X AND file:Y) AND (category:A OR topic:B)
+
+    This enables precise project-scoped searches while allowing flexible semantic filtering.
+    Works consistently for both Claude Code (via hooks) and Codex (direct MCP calls).
+
+    **Legacy Mode (use_hybrid=False):**
+    Uses simple match_all parameter: all AND or all OR.
 
     Args:
-        tags: Tag or list of tags to search for
-        match_all: If True, memory must have ALL tags; if False, ANY tag
+        tags: Tag or list of tags to search for (comma-separated string or list)
+        match_all: If True (legacy mode only), memory must have ALL tags; if False, ANY tag
+        include_body: If True, include full memory content; if False, return metadata only
+        max_tokens: Maximum tokens for body content (0 = unlimited)
+        use_hybrid: If True (default), auto-detect project:/file: tags for hybrid AND/OR.
+                   If False, use legacy single-operation (match_all) behavior.
 
     Returns:
-        Dictionary with matching memories
+        Dictionary with matching memories, tags used, match_type, and count
+
+    Examples:
+        # Hybrid search (default): project AND, others OR
+        search_by_tag(["project:my-app", "category:docs", "topic:api"])
+        # Returns: memories matching project:my-app AND (category:docs OR topic:api)
+
+        # Exact file lookup: both required
+        search_by_tag(["project:my-app", "file:critical-path.md"])
+        # Returns: only memories with BOTH tags
+
+        # Legacy OR search
+        search_by_tag(["tag1", "tag2"], use_hybrid=False)
+        # Returns: memories with tag1 OR tag2
     """
     # Delegate to shared MemoryService business logic
     memory_service = ctx.request_context.lifespan_context.memory_service
     return await memory_service.search_by_tag(
         tags=tags,
-        match_all=match_all
+        match_all=match_all,
+        include_body=include_body,
+        max_tokens=max_tokens,
+        use_hybrid=use_hybrid
     )
 
 @mcp.tool()

@@ -54,13 +54,22 @@ class SemanticSearchRequest(BaseModel):
     query: str = Field(..., description="The search query for semantic similarity")
     n_results: int = Field(default=10, ge=1, le=100, description="Maximum number of results to return")
     similarity_threshold: Optional[float] = Field(None, ge=0.0, le=1.0, description="Minimum similarity score")
+    project: Optional[str] = Field(None, description="Filter results to memories tagged with this project name (uses 'project:{name}' tag convention)")
 
 
 class TagSearchRequest(BaseModel):
-    """Request model for tag-based search."""
-    tags: List[str] = Field(..., description="List of tags to search for (ANY match)")
-    match_all: bool = Field(default=False, description="If true, memory must have ALL tags; if false, ANY tag")
+    """Request model for tag-based search with intelligent hybrid AND/OR logic."""
+    tags: List[str] = Field(..., description="List of tags to search for")
+    match_all: bool = Field(default=False, description="Legacy mode: if true, ALL tags must match; if false, ANY tag (ignored when use_hybrid=True)")
+    use_hybrid: bool = Field(
+        default=True,
+        description="If true (default), auto-detect project:/file: tags for hybrid AND/OR logic. "
+                    "Required tags (project:*, file:*) use AND, optional tags use OR. "
+                    "Query pattern: WHERE (project:X AND file:Y) AND (category:A OR topic:B)"
+    )
     time_filter: Optional[str] = Field(None, description="Optional natural language time filter (e.g., 'last week', 'yesterday')")
+    include_body: bool = Field(default=True, description="If true, include memory content; if false, return metadata only")
+    max_tokens: int = Field(default=0, ge=0, description="Maximum tokens for content (0 = unlimited, applies only when include_body=True)")
 
 
 class TimeSearchRequest(BaseModel):
@@ -126,7 +135,17 @@ async def semantic_search(
             query=request.query,
             n_results=request.n_results
         )
-        
+
+        # Filter by project tag if specified
+        # Project filtering uses the 'project:{name}' tag convention
+        if request.project:
+            project_tag = f"project:{request.project}"
+            logger.debug(f"Filtering semantic search by project tag: {project_tag}")
+            query_results = [
+                result for result in query_results
+                if project_tag in (result.memory.tags or [])
+            ]
+
         # Filter by similarity threshold if specified
         if request.similarity_threshold is not None:
             query_results = [
@@ -174,10 +193,18 @@ async def tag_search(
     user: AuthenticationResult = Depends(require_read_access) if OAUTH_ENABLED else None
 ):
     """
-    Search memories by tags with optional time filtering.
+    Search memories by tags with intelligent hybrid AND/OR logic.
 
-    Finds memories that contain any of the specified tags (OR search) or
-    all of the specified tags (AND search) based on the match_all parameter.
+    **Hybrid Mode (default, use_hybrid=True):**
+    When tags contain both required prefixes (project:, file:) and other tags,
+    automatically applies smart query logic:
+    - Required tags (project:*, file:*): ALL must match (AND logic)
+    - Optional tags (category:*, topic:*, etc.): At least ONE must match (OR logic)
+
+    Query pattern: WHERE (project:X AND file:Y) AND (category:A OR topic:B)
+
+    **Legacy Mode (use_hybrid=False):**
+    Uses simple match_all parameter: all AND or all OR.
 
     Optionally filters by time range using natural language expressions like
     'last week', 'yesterday', 'this month', etc.
@@ -191,30 +218,88 @@ async def tag_search(
 
         # Parse time filter if provided
         time_start = None
+        time_end = None
         if request.time_filter:
             start_ts, _ = parse_time_expression(request.time_filter)
             time_start = start_ts if start_ts else None
 
-        # Use the storage layer's tag search with optional time filtering
-        memories = await storage.search_by_tag(request.tags, time_start=time_start)
+        # Determine if hybrid search should be used
+        required_prefixes = ('project:', 'file:')
+        has_required_tags = any(t.startswith(required_prefixes) for t in request.tags)
+        has_optional_tags = any(not t.startswith(required_prefixes) for t in request.tags)
 
-        # If match_all is True, filter to only memories that have ALL tags
-        if request.match_all and len(request.tags) > 1:
+        # Use hybrid search when:
+        # 1. use_hybrid is enabled (default)
+        # 2. Tags contain at least one required prefix AND at least one optional tag
+        # 3. Storage backend supports hybrid search
+        use_hybrid_search = (
+            request.use_hybrid and
+            has_required_tags and
+            has_optional_tags and
+            hasattr(storage, 'search_by_tags_hybrid')
+        )
+
+        # Smart mode: Auto-detect when to use AND vs OR vs HYBRID
+        # - All required tags (project:, file:) → AND logic (implicit match_all)
+        # - Both required and optional → HYBRID (required=AND, optional=OR)
+        # - All optional tags → Legacy (match_all param decides)
+        all_required = has_required_tags and not has_optional_tags
+
+        if use_hybrid_search:
+            # Use optimized hybrid search with auto-classified AND/OR logic
+            logger.info(f"Using hybrid tag search (project/file=AND, others=OR) for tags: {request.tags}")
+            memories = await storage.search_by_tags_hybrid(
+                tags=request.tags,
+                time_start=time_start,
+                time_end=time_end
+            )
+            # Classify tags for match_type reporting
+            required_tags = [t for t in request.tags if t.startswith(required_prefixes)]
+            optional_tags = [t for t in request.tags if not t.startswith(required_prefixes)]
+            match_type = f"HYBRID (required={len(required_tags)} AND, optional={len(optional_tags)} OR)"
+        elif all_required and request.use_hybrid:
+            # All tags are required (project:, file:) - automatically use AND semantics
+            logger.info(f"All tags are required prefixes, using AND logic: {request.tags}")
+            memories = await storage.search_by_tag(request.tags, time_start=time_start)
+            # Filter to only memories that have ALL tags
             tag_set = set(request.tags)
             memories = [
                 memory for memory in memories
                 if tag_set.issubset(set(memory.tags))
             ]
+            match_type = "ALL (auto-AND for required tags)"
+        else:
+            # Fall back to legacy search
+            memories = await storage.search_by_tag(request.tags, time_start=time_start)
+
+            # If match_all is True, filter to only memories that have ALL tags
+            if request.match_all and len(request.tags) > 1:
+                tag_set = set(request.tags)
+                memories = [
+                    memory for memory in memories
+                    if tag_set.issubset(set(memory.tags))
+                ]
+            match_type = "ALL" if request.match_all else "ANY"
 
         # Convert to search results
-        match_type = "ALL" if request.match_all else "ANY"
-        search_results = [
-            memory_to_search_result(
+        search_results = []
+        for memory in memories:
+            result = memory_to_search_result(
                 memory,
                 reason=f"Tags match ({match_type}): {', '.join(set(memory.tags) & set(request.tags))}"
             )
-            for memory in memories
-        ]
+
+            # Apply payload hygiene
+            if not request.include_body:
+                # Remove body content, keep metadata only
+                result.memory.content = None
+            elif request.max_tokens > 0 and result.memory.content:
+                # Truncate content to max_tokens (rough estimate: 4 chars per token)
+                max_chars = request.max_tokens * 4
+                if len(result.memory.content) > max_chars:
+                    result.memory.content = result.memory.content[:max_chars] + "..."
+
+            search_results.append(result)
 
         processing_time = (time.time() - start_time) * 1000
 

@@ -450,7 +450,10 @@ class MemoryService:
     async def search_by_tag(
         self,
         tags: Union[str, List[str]],
-        match_all: bool = False
+        match_all: bool = False,
+        include_body: bool = True,
+        max_tokens: int = 0,
+        use_hybrid: bool = True
     ) -> Union[SearchByTagSuccess, SearchByTagError]:
         """
         Search memories by tags with flexible matching options.
@@ -458,6 +461,12 @@ class MemoryService:
         Args:
             tags: Tag or list of tags to search for
             match_all: If True, memory must have ALL tags; if False, ANY tag
+            include_body: If True, include full memory content; if False, return metadata only
+            max_tokens: Maximum tokens for body content (0 = unlimited, applies only when include_body=True)
+            use_hybrid: If True (default), automatically use hybrid AND/OR logic when
+                       project: or file: tags are detected. This treats project: and file:
+                       tags as required (AND) while other tags use OR logic.
+                       Set to False to use legacy single-operation behavior.
 
         Returns:
             Dictionary with matching memories
@@ -466,23 +475,81 @@ class MemoryService:
             # Normalize tags to list (handles all formats including comma-separated)
             tags = normalize_tags(tags)
 
-            # Search using database-level filtering
-            # Note: Using search_by_tag from base class (singular)
-            memories = await self.storage.search_by_tag(tags=tags)
+            # Detect if hybrid logic should be used
+            # Required prefixes that trigger AND semantics
+            required_prefixes = ('project:', 'file:')
+            has_required_tags = any(t.startswith(required_prefixes) for t in tags)
+            has_optional_tags = any(not t.startswith(required_prefixes) for t in tags)
+
+            # Use hybrid logic if:
+            # 1. use_hybrid is enabled (default)
+            # 2. Tags contain at least one required prefix (project: or file:)
+            # 3. Tags contain at least one optional tag (otherwise, simple AND/OR is sufficient)
+            # 4. Storage backend supports hybrid search
+            use_hybrid_search = (
+                use_hybrid and
+                has_required_tags and
+                has_optional_tags and
+                hasattr(self.storage, 'search_by_tags_hybrid')
+            )
+
+            # Smart mode: Auto-detect when to use AND vs OR vs HYBRID
+            # - All required tags (project:, file:) → AND logic (implicit match_all)
+            # - Both required and optional → HYBRID (required=AND, optional=OR)
+            # - All optional tags → Legacy (match_all param decides)
+            all_required = has_required_tags and not has_optional_tags
+
+            if use_hybrid_search:
+                # Use optimized hybrid search with auto-classified AND/OR logic
+                logger.info(f"Using hybrid tag search (project/file=AND, others=OR) for tags: {tags}")
+                memories = await self.storage.search_by_tags_hybrid(tags=tags)
+            elif all_required and use_hybrid:
+                # All tags are required (project:, file:) - automatically use AND semantics
+                logger.info(f"All tags are required prefixes, using AND logic: {tags}")
+                operation = "AND"
+                memories = await self.storage.search_by_tags(tags=tags, operation=operation)
+            else:
+                # Fall back to simple AND/OR operation
+                operation = "AND" if match_all else "OR"
+                memories = await self.storage.search_by_tags(tags=tags, operation=operation)
 
             # Format results
             results = []
             for memory in memories:
-                results.append(self._format_memory_response(memory))
+                formatted = self._format_memory_response(memory)
+
+                # Apply payload hygiene if requested
+                if not include_body:
+                    # Remove body content, keep only metadata
+                    formatted.pop("content", None)
+                elif max_tokens > 0 and "content" in formatted:
+                    # Truncate content to max_tokens (rough estimate: 4 chars per token)
+                    max_chars = max_tokens * 4
+                    content = formatted["content"]
+                    if len(content) > max_chars:
+                        formatted["content"] = content[:max_chars] + "..."
+                        formatted["truncated"] = True
+
+                results.append(formatted)
 
             # Determine match type description
-            match_type = "ALL" if match_all else "ANY"
+            if use_hybrid_search:
+                # Hybrid mode: required tags AND, optional tags OR
+                required_tags = [t for t in tags if t.startswith(required_prefixes)]
+                optional_tags = [t for t in tags if not t.startswith(required_prefixes)]
+                match_type = f"HYBRID (required={len(required_tags)} AND, optional={len(optional_tags)} OR)"
+            elif all_required and use_hybrid:
+                # All tags are required - auto-AND mode
+                match_type = "ALL (auto-AND for required tags)"
+            else:
+                match_type = "ALL" if match_all else "ANY"
 
             return {
                 "memories": results,
                 "tags": tags,
                 "match_type": match_type,
-                "count": len(results)
+                "count": len(results),
+                "hybrid_mode": use_hybrid_search
             }
 
         except Exception as e:
