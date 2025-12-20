@@ -763,14 +763,33 @@ SOLUTIONS:
         try:
             if not self.conn:
                 return False, "Database not initialized"
-            
-            # Check for duplicates
+
+            # Extract project tag for scoped duplicate check
+            project_tag = None
+            if memory.tags:
+                for tag in memory.tags:
+                    if tag.startswith("project:"):
+                        project_tag = tag
+                        break
+
+            # Check for duplicates - project-scoped if project tag exists
+            # This allows the same governance content to exist in multiple projects
             cursor = self.conn.execute(
-                'SELECT content_hash FROM memories WHERE content_hash = ?',
+                'SELECT content_hash, tags FROM memories WHERE content_hash = ?',
                 (memory.content_hash,)
             )
-            if cursor.fetchone():
-                return False, "Duplicate content detected"
+            existing = cursor.fetchone()
+            if existing:
+                existing_tags = existing[1] if existing[1] else ""
+                # If we have a project tag, only consider it a duplicate if same project
+                if project_tag:
+                    if project_tag in existing_tags.split(","):
+                        return False, "Duplicate content detected"
+                    # Different project - not a duplicate, allow storage
+                    logger.debug(f"Content hash exists in different project, allowing: {memory.content_hash}")
+                else:
+                    # No project tag - use global duplicate check
+                    return False, "Duplicate content detected"
             
             # Generate and validate embedding
             try:
@@ -840,60 +859,156 @@ SOLUTIONS:
             logger.error(traceback.format_exc())
             return False, error_msg
     
-    async def retrieve(self, query: str, n_results: int = 5) -> List[MemoryQueryResult]:
-        """Retrieve memories using semantic search."""
+    # Configuration constants for tag filtering
+    _MAX_CANDIDATE_POOL = 1000
+    _DEFAULT_CANDIDATE_MULTIPLIER = 5
+
+    def _escape_like_wildcards(self, tag: str) -> str:
+        """Escape SQL LIKE wildcards in tag values.
+
+        Note: Tags are constrained to alphanumeric, colons, hyphens, underscores,
+        and dots. Commas and backslashes are NOT allowed in tag values.
+        This constraint is enforced at ingestion time.
+        """
+        return tag.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+    def _build_exact_tag_condition(self, tag: str) -> tuple[str, list]:
+        """Build SQL condition for exact tag matching in comma-separated string.
+
+        Avoids false positives like 'project:foo' matching 'project:foobar'.
+        Tags are stored as: "project:foo,category:core,file:test.md"
+
+        Returns:
+            Tuple of (SQL condition string, list of parameters)
+        """
+        escaped = self._escape_like_wildcards(tag)
+        # Match: start of string, after comma, end of string, or exact match
+        condition = (
+            "(m.tags LIKE ? || ',%' ESCAPE '\\' "  # tag at start
+            "OR m.tags LIKE '%,' || ? || ',%' ESCAPE '\\' "  # tag in middle
+            "OR m.tags LIKE '%,' || ? ESCAPE '\\' "  # tag at end
+            "OR m.tags = ?)"  # exact single tag
+        )
+        # Escaped for LIKE patterns, original for exact match
+        params = [escaped, escaped, escaped, tag]
+        return condition, params
+
+    async def retrieve(
+        self,
+        query: str,
+        n_results: int = 5,
+        tags: Optional[List[str]] = None,
+        tag_operation: str = "OR",
+        similarity_threshold: Optional[float] = None
+    ) -> List[MemoryQueryResult]:
+        """Retrieve memories using semantic search with optional tag filtering.
+
+        Args:
+            query: Semantic search query
+            n_results: Maximum results to return
+            tags: Optional list of tags to filter by (exact boundary matching)
+            tag_operation: "AND" (all tags must match) or "OR" (any tag matches)
+            similarity_threshold: Minimum similarity score (0.0-1.0)
+        """
         try:
             if not self.conn:
                 logger.error("Database not initialized")
                 return []
-            
+
             if not self.embedding_model:
                 logger.warning("No embedding model available, cannot perform semantic search")
                 return []
-            
+
+            # Validate tag_operation
+            if tag_operation not in ("AND", "OR"):
+                logger.warning(f"Invalid tag_operation '{tag_operation}', defaulting to OR")
+                tag_operation = "OR"
+
             # Generate query embedding
             try:
                 query_embedding = self._generate_embedding(query)
             except Exception as e:
                 logger.error(f"Failed to generate query embedding: {str(e)}")
                 return []
-            
+
             # First, check if embeddings table has data
             cursor = self.conn.execute('SELECT COUNT(*) FROM memory_embeddings')
             embedding_count = cursor.fetchone()[0]
-            
+
             if embedding_count == 0:
                 logger.warning("No embeddings found in database. Memories may have been stored without embeddings.")
                 return []
-            
+
+            # Build tag filter clause with exact boundary matching
+            tag_where_conditions = []
+            tag_params = []
+            candidate_limit = n_results  # No multiplier if no tags
+
+            if tags:
+                op = " AND " if tag_operation == "AND" else " OR "
+                conditions = []
+                for tag in tags:
+                    condition, params = self._build_exact_tag_condition(tag)
+                    conditions.append(condition)
+                    tag_params.extend(params)
+                tag_where_conditions.append(f"({op.join(conditions)})")
+
+                # Apply candidate multiplier only when filtering by tags
+                candidate_limit = min(
+                    n_results * self._DEFAULT_CANDIDATE_MULTIPLIER,
+                    self._MAX_CANDIDATE_POOL
+                )
+                logger.debug(f"Tag filtering enabled: {tags} ({tag_operation}), candidate pool: {candidate_limit}")
+
+            # Add similarity threshold to WHERE clause (applied BEFORE final LIMIT)
+            # Distance is cosine distance: 0 = identical, 2 = opposite
+            # similarity = 1 - (distance / 2), so distance = 2 * (1 - similarity)
+            threshold_params = []
+            if similarity_threshold is not None:
+                max_distance = 2.0 * (1.0 - similarity_threshold)
+                tag_where_conditions.append("e.distance <= ?")
+                threshold_params.append(max_distance)
+                logger.debug(f"Similarity threshold: {similarity_threshold} (max distance: {max_distance})")
+
+            # Build WHERE clause
+            tag_where = ""
+            if tag_where_conditions:
+                tag_where = f"WHERE {' AND '.join(tag_where_conditions)}"
+
             # Perform vector similarity search using JOIN with retry logic
             def search_memories():
-                # Try direct rowid join first
-                cursor = self.conn.execute('''
+                sql_query = f'''
                     SELECT m.content_hash, m.content, m.tags, m.memory_type, m.metadata,
-                           m.created_at, m.updated_at, m.created_at_iso, m.updated_at_iso, 
+                           m.created_at, m.updated_at, m.created_at_iso, m.updated_at_iso,
                            e.distance
                     FROM memories m
                     INNER JOIN (
-                        SELECT rowid, distance 
-                        FROM memory_embeddings 
+                        SELECT rowid, distance
+                        FROM memory_embeddings
                         WHERE content_embedding MATCH ?
                         ORDER BY distance
                         LIMIT ?
                     ) e ON m.id = e.rowid
+                    {tag_where}
                     ORDER BY e.distance
-                ''', (serialize_float32(query_embedding), n_results))
-                
+                    LIMIT ?
+                '''
+
+                # Build parameters: embedding, candidate_limit, tag_params, threshold_params, final_limit
+                params = [serialize_float32(query_embedding), candidate_limit] + tag_params + threshold_params + [n_results]
+
+                cursor = self.conn.execute(sql_query, params)
+
                 # Check if we got results
                 results = cursor.fetchall()
-                if not results:
-                    # Log debug info
+                if not results and not tags:
+                    # Log debug info only for unfiltered queries
                     logger.debug("No results from vector search. Checking database state...")
                     mem_count = self.conn.execute('SELECT COUNT(*) FROM memories').fetchone()[0]
                     logger.debug(f"Memories table has {mem_count} rows, embeddings table has {embedding_count} rows")
-                
+
                 return results
-            
+
             search_results = await self._execute_with_retry(search_memories)
             
             results = []
