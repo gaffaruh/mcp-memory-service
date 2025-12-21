@@ -87,10 +87,11 @@ def create_memory_from_chunk(
         chunk_metadata.update(extra_metadata)
 
     # Create and return memory object
+    final_tags = list(set(all_tags))  # Remove duplicates
     return Memory(
         content=chunk.content,
-        content_hash=generate_content_hash(chunk.content, chunk_metadata),
-        tags=list(set(all_tags)),  # Remove duplicates
+        content_hash=generate_content_hash(chunk.content, chunk_metadata, tags=final_tags),
+        tags=final_tags,
         memory_type=memory_type,
         metadata=chunk_metadata
     )

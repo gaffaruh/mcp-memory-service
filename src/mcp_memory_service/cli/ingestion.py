@@ -116,10 +116,11 @@ def ingest_document(file_path: Path, tags: tuple, chunk_size: int, chunk_overlap
                         all_tags.append(f"path:{str(abs_path)}")
 
                         # Create memory object
+                        final_tags = list(set(all_tags))  # Remove duplicates
                         memory = Memory(
                             content=chunk.content,
-                            content_hash=generate_content_hash(chunk.content, chunk.metadata),
-                            tags=list(set(all_tags)),  # Remove duplicates
+                            content_hash=generate_content_hash(chunk.content, chunk.metadata, tags=final_tags),
+                            tags=final_tags,
                             memory_type=memory_type,
                             metadata=chunk.metadata
                         )

@@ -291,8 +291,8 @@ class MemoryService:
                     final_tags.append(source_tag)
                 final_metadata["hostname"] = client_hostname
 
-            # Generate content hash for deduplication
-            content_hash = generate_content_hash(content)
+            # Generate content hash for deduplication (includes project tag for cross-project uniqueness)
+            content_hash = generate_content_hash(content, tags=final_tags)
 
             # Process content if auto-splitting is enabled and content exceeds max length
             max_length = self.storage.max_content_length
@@ -307,7 +307,7 @@ class MemoryService:
                 stored_memories = []
 
                 for i, chunk in enumerate(chunks):
-                    chunk_hash = generate_content_hash(chunk)
+                    chunk_hash = generate_content_hash(chunk, tags=final_tags)
                     chunk_metadata = final_metadata.copy()
                     chunk_metadata["chunk_index"] = i
                     chunk_metadata["total_chunks"] = len(chunks)
