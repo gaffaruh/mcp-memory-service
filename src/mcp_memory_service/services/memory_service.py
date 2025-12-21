@@ -20,6 +20,12 @@ from ..storage.base import MemoryStorage
 from ..models.memory import Memory
 from ..utils.content_splitter import split_content
 from ..utils.hashing import generate_content_hash
+from ..retrieval.reranker import (
+    get_reranker,
+    is_rerank_enabled,
+    get_rerank_candidates,
+    get_rerank_top_k
+)
 
 logger = logging.getLogger(__name__)
 
@@ -381,27 +387,40 @@ class MemoryService:
         query: str,
         n_results: int = 10,
         tags: Optional[List[str]] = None,
-        memory_type: Optional[str] = None
+        memory_type: Optional[str] = None,
+        use_reranking: Optional[bool] = None
     ) -> Union[RetrieveMemoriesSuccess, RetrieveMemoriesError]:
         """
-        Retrieve memories by semantic search with optional filtering.
+        Retrieve memories by semantic search with optional filtering and reranking.
 
         Args:
             query: Search query string
             n_results: Maximum number of results
             tags: Optional tag filtering
             memory_type: Optional memory type filtering
+            use_reranking: Override reranking setting (default uses env config)
 
         Returns:
             Dictionary with search results
         """
         try:
+            # Determine if reranking should be used
+            # use_reranking=True forces reranking even if globally disabled
+            # use_reranking=None uses the global config
+            # use_reranking=False disables reranking
+            should_attempt_rerank = use_reranking if use_reranking is not None else is_rerank_enabled()
+            force_rerank = use_reranking is True  # Explicit True overrides global setting
+
+            # If reranking, fetch more candidates than requested
+            # Always fetch at least n_results even if candidates config is smaller
+            fetch_count = max(n_results, get_rerank_candidates()) if should_attempt_rerank else n_results
+
             # Retrieve memories using semantic search
             # Note: storage.retrieve() only supports query and n_results
             # We'll filter by tags/type after retrieval if needed
             memories = await self.storage.retrieve(
                 query=query,
-                n_results=n_results
+                n_results=fetch_count
             )
 
             # Apply optional post-filtering
@@ -426,8 +445,38 @@ class MemoryService:
 
                     filtered_memories.append(memory_result)
 
+            # Apply cross-encoder reranking if enabled
+            if should_attempt_rerank and filtered_memories:
+                reranker = get_reranker()
+                # Prepare data for reranking: (content, score, original_result)
+                rerank_input = [
+                    (result.memory.content, result.relevance_score or 0.0, result)
+                    for result in filtered_memories
+                ]
+                # Use get_rerank_top_k() for default, but allow n_results to override
+                top_k = min(n_results, get_rerank_top_k()) if not force_rerank else n_results
+                reranked = reranker.rerank(query, rerank_input, top_k=top_k, force=force_rerank)
+
+                results = []
+                actually_reranked = False
+                for rr in reranked:
+                    memory_dict = self._format_memory_response(rr.original_data.memory)
+                    memory_dict['similarity_score'] = rr.original_score
+                    memory_dict['rerank_score'] = rr.rerank_score
+                    results.append(memory_dict)
+                    if rr.was_reranked:
+                        actually_reranked = True
+
+                return {
+                    "memories": results,
+                    "query": query,
+                    "count": len(results),
+                    "reranked": actually_reranked
+                }
+
+            # Standard results without reranking
             results = []
-            for result in filtered_memories:
+            for result in filtered_memories[:n_results]:
                 # Extract Memory object from MemoryQueryResult and add similarity score
                 memory_dict = self._format_memory_response(result.memory)
                 memory_dict['similarity_score'] = result.relevance_score
