@@ -167,7 +167,7 @@ def ingest_document(file_path: Path, tags: tuple, chunk_size: int, chunk_overlap
             return False
         finally:
             if 'storage' in locals():
-                await storage.close()
+                storage.close()  # close() is sync, not async
     
     success = asyncio.run(run_ingestion())
     sys.exit(0 if success else 1)
@@ -349,7 +349,7 @@ def ingest_directory(directory_path: Path, tags: tuple, recursive: bool, extensi
             return False
         finally:
             if storage:
-                await storage.close()
+                storage.close()  # close() is sync, not async
     
     success = asyncio.run(run_batch_ingestion())
     sys.exit(0 if success else 1)
