@@ -506,6 +506,10 @@ CORS_ORIGINS = os.getenv('MCP_CORS_ORIGINS', '*').split(',')
 SSE_HEARTBEAT_INTERVAL = safe_get_int_env('MCP_SSE_HEARTBEAT', 30, min_value=5, max_value=300)  # 5 seconds to 5 minutes
 API_KEY = os.getenv('MCP_API_KEY', None)  # Optional authentication
 
+# Unix domain socket (preferred over TCP when set)
+MEMORY_SOCKET_PATH = os.getenv('MEMORY_SOCKET_PATH', '/tmp/workflow/memory.sock')
+MEMORY_SOCKET_ENABLED = os.getenv('MEMORY_SOCKET_ENABLED', 'true').lower() == 'true'
+
 # HTTPS Configuration
 HTTPS_ENABLED = os.getenv('MCP_HTTPS_ENABLED', 'false').lower() == 'true'
 SSL_CERT_FILE = os.getenv('MCP_SSL_CERT_FILE', None)

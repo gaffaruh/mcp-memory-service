@@ -41,7 +41,7 @@ from ..config import (
     OAUTH_ENABLED,
     CONSOLIDATION_ENABLED,
     CONSOLIDATION_CONFIG,
-    CONSOLIDATION_SCHEDULE
+    CONSOLIDATION_SCHEDULE,
 )
 from .dependencies import set_storage, get_storage, create_storage_backend
 from .api.health import router as health_router
@@ -102,6 +102,7 @@ async def lifespan(app: FastAPI):
 
     # Startup
     logger.info("Starting MCP Memory Service HTTP interface...")
+
     try:
         storage = await create_storage_backend()
         set_storage(storage)  # Set the global storage instance

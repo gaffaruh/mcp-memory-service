@@ -153,7 +153,8 @@ def main():
         import uvicorn
         from mcp_memory_service.web.app import app
         from mcp_memory_service.config import (
-            HTTP_HOST, HTTP_PORT, HTTPS_ENABLED, SSL_CERT_FILE, SSL_KEY_FILE
+            HTTP_HOST, HTTP_PORT, HTTPS_ENABLED, SSL_CERT_FILE, SSL_KEY_FILE,
+            MEMORY_SOCKET_PATH, MEMORY_SOCKET_ENABLED
         )
         
         # SSL configuration
@@ -183,33 +184,54 @@ def main():
                     protocol = "http"
                     ssl_certfile = ssl_keyfile = None
         
-        # Display startup information
-        host_display = HTTP_HOST if HTTP_HOST != '0.0.0.0' else 'localhost'
-        print(f"Starting MCP Memory Service {protocol.upper()} server on {HTTP_HOST}:{HTTP_PORT}")
-        print(f"Dashboard: {protocol}://{host_display}:{HTTP_PORT}")
-        print(f"API Docs: {protocol}://{host_display}:{HTTP_PORT}/api/docs")
-        
-        if protocol == "https":
-            print(f"SSL Certificate: {ssl_certfile}")
-            print(f"SSL Key: {ssl_keyfile}")
-            print("NOTE: Browsers may show security warnings for self-signed certificates")
-        
-        print("Press Ctrl+C to stop")
-        
-        # Start uvicorn server
-        uvicorn_kwargs = {
-            "app": app,
-            "host": HTTP_HOST,
-            "port": HTTP_PORT,
-            "log_level": "info",
-            "access_log": True
-        }
-        
-        if ssl_certfile and ssl_keyfile:
-            uvicorn_kwargs["ssl_certfile"] = ssl_certfile
-            uvicorn_kwargs["ssl_keyfile"] = ssl_keyfile
-        
-        uvicorn.run(**uvicorn_kwargs)
+        # Unix socket mode (preferred over TCP when enabled)
+        use_socket = MEMORY_SOCKET_ENABLED and not HTTPS_ENABLED
+
+        if use_socket:
+            socket_dir = os.path.dirname(MEMORY_SOCKET_PATH)
+            os.makedirs(socket_dir, exist_ok=True)
+            # Restrict directory to owner-only: no other user can discover the socket
+            os.chmod(socket_dir, 0o700)
+            # Remove stale socket file if it exists
+            if os.path.exists(MEMORY_SOCKET_PATH):
+                os.unlink(MEMORY_SOCKET_PATH)
+            print(f"Starting MCP Memory Service on Unix socket: {MEMORY_SOCKET_PATH}")
+            print(f"Socket directory restricted to owner-only: {socket_dir}")
+            print("Press Ctrl+C to stop")
+            uvicorn_kwargs = {
+                "app": app,
+                "uds": MEMORY_SOCKET_PATH,
+                "log_level": "info",
+                "access_log": False,
+            }
+            uvicorn.run(**uvicorn_kwargs)
+        else:
+            # TCP mode (HTTPS or socket disabled)
+            host_display = HTTP_HOST if HTTP_HOST != '0.0.0.0' else 'localhost'
+            print(f"Starting MCP Memory Service {protocol.upper()} server on {HTTP_HOST}:{HTTP_PORT}")
+            print(f"Dashboard: {protocol}://{host_display}:{HTTP_PORT}")
+            print(f"API Docs: {protocol}://{host_display}:{HTTP_PORT}/api/docs")
+
+            if protocol == "https":
+                print(f"SSL Certificate: {ssl_certfile}")
+                print(f"SSL Key: {ssl_keyfile}")
+                print("NOTE: Browsers may show security warnings for self-signed certificates")
+
+            print("Press Ctrl+C to stop")
+
+            uvicorn_kwargs = {
+                "app": app,
+                "host": HTTP_HOST,
+                "port": HTTP_PORT,
+                "log_level": "info",
+                "access_log": True,
+            }
+
+            if ssl_certfile and ssl_keyfile:
+                uvicorn_kwargs["ssl_certfile"] = ssl_certfile
+                uvicorn_kwargs["ssl_keyfile"] = ssl_keyfile
+
+            uvicorn.run(**uvicorn_kwargs)
         
     except ImportError as e:
         print(f"Error: Missing dependencies. Please run 'python install.py' first.")
