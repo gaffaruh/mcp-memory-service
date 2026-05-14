@@ -522,8 +522,23 @@ class CloudflareStorage(MemoryStorage):
         if response.status_code not in [200, 201]:
             raise ValueError(f"Failed to store content in R2: {response.status_code}")
     
-    async def retrieve(self, query: str, n_results: int = 5) -> List[MemoryQueryResult]:
-        """Retrieve memories by semantic search."""
+    async def retrieve(
+        self,
+        query: str,
+        n_results: int = 5,
+        tags: Optional[List[str]] = None,
+        tag_operation: str = "OR",
+        similarity_threshold: Optional[float] = None
+    ) -> List[MemoryQueryResult]:
+        """Retrieve memories by semantic search.
+
+        Note: Tag filtering is not yet implemented for Cloudflare backend.
+        Tags parameter is accepted for interface compatibility but ignored.
+        """
+        # TODO: Implement tag filtering for Cloudflare Vectorize
+        if tags:
+            logger.warning("Tag filtering not implemented for Cloudflare backend, ignoring tags parameter")
+
         try:
             # Generate query embedding
             query_embedding = await self._generate_embedding(query)

@@ -64,7 +64,7 @@ class MemoryUpdateRequest(BaseModel):
 
 class MemoryResponse(BaseModel):
     """Response model for memory data."""
-    content: str
+    content: Optional[str] = None  # Optional to support payload hygiene (include_body=False)
     content_hash: str
     tags: List[str]
     memory_type: Optional[str]

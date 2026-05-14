@@ -177,8 +177,8 @@ async def store(
     else:
         tag_list = list(tags)
 
-    # Generate content hash
-    content_hash = generate_content_hash(content)
+    # Generate content hash (includes project/governance tag for cross-project uniqueness)
+    content_hash = generate_content_hash(content, tags=tag_list)
 
     # Create memory object
     memory = Memory(

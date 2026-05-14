@@ -92,8 +92,30 @@ class MemoryStorage(ABC):
         return final_results
     
     @abstractmethod
-    async def retrieve(self, query: str, n_results: int = 5) -> List[MemoryQueryResult]:
-        """Retrieve memories by semantic search."""
+    async def retrieve(
+        self,
+        query: str,
+        n_results: int = 5,
+        tags: Optional[List[str]] = None,
+        tag_operation: str = "OR",
+        similarity_threshold: Optional[float] = None
+    ) -> List[MemoryQueryResult]:
+        """Retrieve memories by semantic search with optional tag filtering.
+
+        Args:
+            query: Semantic search query
+            n_results: Maximum results to return (may return fewer if filtered)
+            tags: Optional list of tags to filter by (uses exact boundary matching)
+            tag_operation: "AND" (all tags must match) or "OR" (any tag matches)
+            similarity_threshold: Minimum similarity score (0.0-1.0), applied before LIMIT
+
+        Returns:
+            List of MemoryQueryResult objects with relevance scores
+
+        Note:
+            When tags are provided, filtering happens at the SQL level before LIMIT,
+            ensuring the requested n_results are tag-matched (not post-filtered).
+        """
         pass
     
     @abstractmethod

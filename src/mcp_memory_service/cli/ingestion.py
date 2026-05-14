@@ -28,6 +28,7 @@ import click
 from ..ingestion import get_loader_for_file, is_supported_file, SUPPORTED_FORMATS
 from ..models.memory import Memory
 from ..utils import create_memory_from_chunk, _process_and_store_chunk
+from ..utils.hashing import generate_content_hash
 
 logger = logging.getLogger(__name__)
 
@@ -108,12 +109,18 @@ def ingest_document(file_path: Path, tags: tuple, chunk_size: int, chunk_overlap
                                 # Split comma-separated string into list
                                 chunk_tags = [tag.strip() for tag in chunk_tags.split(',') if tag.strip()]
                             all_tags.extend(chunk_tags)
-                        
+
+                        # Add automatic path and file tags for consistency with watcher
+                        abs_path = file_path.resolve()
+                        all_tags.append(f"file:{abs_path.name}")
+                        all_tags.append(f"path:{str(abs_path)}")
+
                         # Create memory object
+                        final_tags = list(set(all_tags))  # Remove duplicates
                         memory = Memory(
                             content=chunk.content,
-                            content_hash=generate_content_hash(chunk.content, chunk.metadata),
-                            tags=list(set(all_tags)),  # Remove duplicates
+                            content_hash=generate_content_hash(chunk.content, chunk.metadata, tags=final_tags),
+                            tags=final_tags,
                             memory_type=memory_type,
                             metadata=chunk.metadata
                         )
@@ -160,7 +167,7 @@ def ingest_document(file_path: Path, tags: tuple, chunk_size: int, chunk_overlap
             return False
         finally:
             if 'storage' in locals():
-                await storage.close()
+                storage.close()  # close() is sync, not async
     
     success = asyncio.run(run_ingestion())
     sys.exit(0 if success else 1)
@@ -342,7 +349,7 @@ def ingest_directory(directory_path: Path, tags: tuple, recursive: bool, extensi
             return False
         finally:
             if storage:
-                await storage.close()
+                storage.close()  # close() is sync, not async
     
     success = asyncio.run(run_batch_ingestion())
     sys.exit(0 if success else 1)

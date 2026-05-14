@@ -1579,21 +1579,22 @@ class MemoryServer:
                     types.Tool(
                         name="recall_memory",
                         description="""Retrieve memories using natural language time expressions and optional semantic search.
-                        
+
                         Supports various time-related expressions such as:
                         - "yesterday", "last week", "2 days ago"
                         - "last summer", "this month", "last January"
                         - "spring", "winter", "Christmas", "Thanksgiving"
                         - "morning", "evening", "yesterday afternoon"
-                        
+
                         Examples:
                         {
                             "query": "recall what I stored last week"
                         }
-                        
+
                         {
                             "query": "find information about databases from two months ago",
-                            "n_results": 5
+                            "n_results": 5,
+                            "project": "my-project"
                         }
                         """,
                         inputSchema={
@@ -1607,6 +1608,10 @@ class MemoryServer:
                                     "type": "number",
                                     "default": 5,
                                     "description": "Maximum number of results to return."
+                                },
+                                "project": {
+                                    "type": "string",
+                                    "description": "Filter results to memories tagged with this project name. When specified, only memories with a matching 'project:{name}' tag will be returned."
                                 }
                             },
                             "required": ["query"]
@@ -1619,7 +1624,8 @@ class MemoryServer:
                         Example:
                         {
                             "query": "find this memory",
-                            "n_results": 5
+                            "n_results": 5,
+                            "project": "my-project"
                         }""",
                         inputSchema={
                             "type": "object",
@@ -1632,6 +1638,10 @@ class MemoryServer:
                                     "type": "number",
                                     "default": 5,
                                     "description": "Maximum number of results to return."
+                                },
+                                "project": {
+                                    "type": "string",
+                                    "description": "Filter results to memories tagged with this project name. When specified, only memories with a matching 'project:{name}' tag will be returned."
                                 }
                             },
                             "required": ["query"]
@@ -2447,10 +2457,11 @@ class MemoryServer:
     async def handle_retrieve_memory(self, arguments: dict) -> List[types.TextContent]:
         query = arguments.get("query")
         n_results = arguments.get("n_results", 5)
-        
+        project = arguments.get("project")
+
         if not query:
             return [types.TextContent(type="text", text="Error: Query is required")]
-        
+
         try:
             # Initialize storage lazily when needed (also initializes memory_service)
             await self._ensure_storage_initialized()
@@ -2458,10 +2469,18 @@ class MemoryServer:
             # Track performance
             start_time = time.time()
 
+            # Build tags filter if project is specified
+            # Project filtering uses the 'project:{name}' tag convention
+            tags = None
+            if project:
+                tags = [f"project:{project}"]
+                logger.info(f"Filtering retrieve_memory by project tag: project:{project}")
+
             # Call shared MemoryService business logic
             result = await self.memory_service.retrieve_memories(
                 query=query,
-                n_results=n_results
+                n_results=n_results,
+                tags=tags
             )
 
             query_time_ms = (time.time() - start_time) * 1000
@@ -3131,15 +3150,21 @@ Memories Archived: {report.memories_archived}"""
     async def handle_recall_memory(self, arguments: dict) -> List[types.TextContent]:
         """
         Handle memory recall requests with natural language time expressions.
-        
+
         This handler parses natural language time expressions from the query,
         extracts time ranges, and combines them with optional semantic search.
         """
         query = arguments.get("query", "")
         n_results = arguments.get("n_results", 5)
-        
+        project = arguments.get("project")
+
         if not query:
             return [types.TextContent(type="text", text="Error: Query is required")]
+
+        # Build project tag for filtering
+        project_tag = f"project:{project}" if project else None
+        if project_tag:
+            logger.info(f"Filtering recall_memory by project tag: {project_tag}")
         
         try:
             # Initialize storage lazily when needed
@@ -3181,15 +3206,31 @@ Memories Archived: {report.memories_archived}"""
 
             # Use the enhanced recall method that combines semantic search with time filtering,
             # or just time filtering if no semantic query
+            # Request extra results if project filtering is enabled to account for filtering
+            fetch_count = n_results * 3 if project_tag else n_results
             results = await storage.recall(
                 query=semantic_query,
-                n_results=n_results,
+                n_results=fetch_count,
                 start_timestamp=start_timestamp,
                 end_timestamp=end_timestamp
             )
-            
+
+            # Apply project tag filtering if specified
+            if project_tag and results:
+                filtered_results = []
+                for result in results:
+                    memory_tags = result.memory.tags or []
+                    if project_tag in memory_tags:
+                        filtered_results.append(result)
+                        if len(filtered_results) >= n_results:
+                            break
+                results = filtered_results
+                logger.info(f"After project filtering: {len(results)} memories remain")
+
             if not results:
                 no_results_msg = f"No memories found{time_range_str}"
+                if project_tag:
+                    no_results_msg += f" for project '{project}'"
                 return [types.TextContent(type="text", text=no_results_msg)]
             
             # Format results
@@ -3728,10 +3769,11 @@ Memories Archived: {report.memories_archived}"""
                         all_tags.extend(chunk_tags)
                     
                     # Create memory object
+                    final_tags = list(set(all_tags))  # Remove duplicates
                     memory = Memory(
                         content=chunk.content,
-                        content_hash=generate_content_hash(chunk.content, chunk.metadata),
-                        tags=list(set(all_tags)),  # Remove duplicates
+                        content_hash=generate_content_hash(chunk.content, chunk.metadata, tags=final_tags),
+                        tags=final_tags,
                         memory_type=memory_type,
                         metadata=chunk.metadata
                     )

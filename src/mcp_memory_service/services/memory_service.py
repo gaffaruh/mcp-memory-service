@@ -20,6 +20,12 @@ from ..storage.base import MemoryStorage
 from ..models.memory import Memory
 from ..utils.content_splitter import split_content
 from ..utils.hashing import generate_content_hash
+from ..retrieval.reranker import (
+    get_reranker,
+    is_rerank_enabled,
+    get_rerank_candidates,
+    get_rerank_top_k
+)
 
 logger = logging.getLogger(__name__)
 
@@ -291,8 +297,8 @@ class MemoryService:
                     final_tags.append(source_tag)
                 final_metadata["hostname"] = client_hostname
 
-            # Generate content hash for deduplication
-            content_hash = generate_content_hash(content)
+            # Generate content hash for deduplication (includes project tag for cross-project uniqueness)
+            content_hash = generate_content_hash(content, tags=final_tags)
 
             # Process content if auto-splitting is enabled and content exceeds max length
             max_length = self.storage.max_content_length
@@ -307,7 +313,7 @@ class MemoryService:
                 stored_memories = []
 
                 for i, chunk in enumerate(chunks):
-                    chunk_hash = generate_content_hash(chunk)
+                    chunk_hash = generate_content_hash(chunk, tags=final_tags)
                     chunk_metadata = final_metadata.copy()
                     chunk_metadata["chunk_index"] = i
                     chunk_metadata["total_chunks"] = len(chunks)
@@ -381,50 +387,96 @@ class MemoryService:
         query: str,
         n_results: int = 10,
         tags: Optional[List[str]] = None,
-        memory_type: Optional[str] = None
+        memory_type: Optional[str] = None,
+        use_reranking: Optional[bool] = None
     ) -> Union[RetrieveMemoriesSuccess, RetrieveMemoriesError]:
         """
-        Retrieve memories by semantic search with optional filtering.
+        Retrieve memories by semantic search with optional filtering and reranking.
 
         Args:
             query: Search query string
             n_results: Maximum number of results
             tags: Optional tag filtering
             memory_type: Optional memory type filtering
+            use_reranking: Override reranking setting (default uses env config)
 
         Returns:
             Dictionary with search results
         """
         try:
+            # Determine if reranking should be used
+            # use_reranking=True forces reranking even if globally disabled
+            # use_reranking=None uses the global config
+            # use_reranking=False disables reranking
+            should_attempt_rerank = use_reranking if use_reranking is not None else is_rerank_enabled()
+            force_rerank = use_reranking is True  # Explicit True overrides global setting
+
+            # If reranking, fetch more candidates than requested
+            # Always fetch at least n_results even if candidates config is smaller
+            fetch_count = max(n_results, get_rerank_candidates()) if should_attempt_rerank else n_results
+
             # Retrieve memories using semantic search
             # Note: storage.retrieve() only supports query and n_results
             # We'll filter by tags/type after retrieval if needed
             memories = await self.storage.retrieve(
                 query=query,
-                n_results=n_results
+                n_results=fetch_count
             )
 
             # Apply optional post-filtering
             filtered_memories = memories
             if tags or memory_type:
                 filtered_memories = []
-                for memory in memories:
+                for memory_result in memories:
+                    # memory_result is a MemoryQueryResult, access the Memory object via .memory
+                    mem = memory_result.memory
+
                     # Filter by tags if specified
                     if tags:
-                        memory_tags = memory.metadata.get('tags', []) if hasattr(memory, 'metadata') else []
+                        memory_tags = mem.tags if hasattr(mem, 'tags') else []
                         if not any(tag in memory_tags for tag in tags):
                             continue
 
                     # Filter by memory_type if specified
                     if memory_type:
-                        mem_type = memory.metadata.get('memory_type', '') if hasattr(memory, 'metadata') else ''
+                        mem_type = mem.memory_type if hasattr(mem, 'memory_type') else ''
                         if mem_type != memory_type:
                             continue
 
-                    filtered_memories.append(memory)
+                    filtered_memories.append(memory_result)
 
+            # Apply cross-encoder reranking if enabled
+            if should_attempt_rerank and filtered_memories:
+                reranker = get_reranker()
+                # Prepare data for reranking: (content, score, original_result)
+                rerank_input = [
+                    (result.memory.content, result.relevance_score or 0.0, result)
+                    for result in filtered_memories
+                ]
+                # Use get_rerank_top_k() for default, but allow n_results to override
+                top_k = min(n_results, get_rerank_top_k()) if not force_rerank else n_results
+                reranked = reranker.rerank(query, rerank_input, top_k=top_k, force=force_rerank)
+
+                results = []
+                actually_reranked = False
+                for rr in reranked:
+                    memory_dict = self._format_memory_response(rr.original_data.memory)
+                    memory_dict['similarity_score'] = rr.original_score
+                    memory_dict['rerank_score'] = rr.rerank_score
+                    results.append(memory_dict)
+                    if rr.was_reranked:
+                        actually_reranked = True
+
+                return {
+                    "memories": results,
+                    "query": query,
+                    "count": len(results),
+                    "reranked": actually_reranked
+                }
+
+            # Standard results without reranking
             results = []
-            for result in filtered_memories:
+            for result in filtered_memories[:n_results]:
                 # Extract Memory object from MemoryQueryResult and add similarity score
                 memory_dict = self._format_memory_response(result.memory)
                 memory_dict['similarity_score'] = result.relevance_score
@@ -447,7 +499,10 @@ class MemoryService:
     async def search_by_tag(
         self,
         tags: Union[str, List[str]],
-        match_all: bool = False
+        match_all: bool = False,
+        include_body: bool = True,
+        max_tokens: int = 0,
+        use_hybrid: bool = True
     ) -> Union[SearchByTagSuccess, SearchByTagError]:
         """
         Search memories by tags with flexible matching options.
@@ -455,6 +510,12 @@ class MemoryService:
         Args:
             tags: Tag or list of tags to search for
             match_all: If True, memory must have ALL tags; if False, ANY tag
+            include_body: If True, include full memory content; if False, return metadata only
+            max_tokens: Maximum tokens for body content (0 = unlimited, applies only when include_body=True)
+            use_hybrid: If True (default), automatically use hybrid AND/OR logic when
+                       project: or file: tags are detected. This treats project: and file:
+                       tags as required (AND) while other tags use OR logic.
+                       Set to False to use legacy single-operation behavior.
 
         Returns:
             Dictionary with matching memories
@@ -463,23 +524,81 @@ class MemoryService:
             # Normalize tags to list (handles all formats including comma-separated)
             tags = normalize_tags(tags)
 
-            # Search using database-level filtering
-            # Note: Using search_by_tag from base class (singular)
-            memories = await self.storage.search_by_tag(tags=tags)
+            # Detect if hybrid logic should be used
+            # Required prefixes that trigger AND semantics
+            required_prefixes = ('project:', 'file:')
+            has_required_tags = any(t.startswith(required_prefixes) for t in tags)
+            has_optional_tags = any(not t.startswith(required_prefixes) for t in tags)
+
+            # Use hybrid logic if:
+            # 1. use_hybrid is enabled (default)
+            # 2. Tags contain at least one required prefix (project: or file:)
+            # 3. Tags contain at least one optional tag (otherwise, simple AND/OR is sufficient)
+            # 4. Storage backend supports hybrid search
+            use_hybrid_search = (
+                use_hybrid and
+                has_required_tags and
+                has_optional_tags and
+                hasattr(self.storage, 'search_by_tags_hybrid')
+            )
+
+            # Smart mode: Auto-detect when to use AND vs OR vs HYBRID
+            # - All required tags (project:, file:) → AND logic (implicit match_all)
+            # - Both required and optional → HYBRID (required=AND, optional=OR)
+            # - All optional tags → Legacy (match_all param decides)
+            all_required = has_required_tags and not has_optional_tags
+
+            if use_hybrid_search:
+                # Use optimized hybrid search with auto-classified AND/OR logic
+                logger.info(f"Using hybrid tag search (project/file=AND, others=OR) for tags: {tags}")
+                memories = await self.storage.search_by_tags_hybrid(tags=tags)
+            elif all_required and use_hybrid:
+                # All tags are required (project:, file:) - automatically use AND semantics
+                logger.info(f"All tags are required prefixes, using AND logic: {tags}")
+                operation = "AND"
+                memories = await self.storage.search_by_tags(tags=tags, operation=operation)
+            else:
+                # Fall back to simple AND/OR operation
+                operation = "AND" if match_all else "OR"
+                memories = await self.storage.search_by_tags(tags=tags, operation=operation)
 
             # Format results
             results = []
             for memory in memories:
-                results.append(self._format_memory_response(memory))
+                formatted = self._format_memory_response(memory)
+
+                # Apply payload hygiene if requested
+                if not include_body:
+                    # Remove body content, keep only metadata
+                    formatted.pop("content", None)
+                elif max_tokens > 0 and "content" in formatted:
+                    # Truncate content to max_tokens (rough estimate: 4 chars per token)
+                    max_chars = max_tokens * 4
+                    content = formatted["content"]
+                    if len(content) > max_chars:
+                        formatted["content"] = content[:max_chars] + "..."
+                        formatted["truncated"] = True
+
+                results.append(formatted)
 
             # Determine match type description
-            match_type = "ALL" if match_all else "ANY"
+            if use_hybrid_search:
+                # Hybrid mode: required tags AND, optional tags OR
+                required_tags = [t for t in tags if t.startswith(required_prefixes)]
+                optional_tags = [t for t in tags if not t.startswith(required_prefixes)]
+                match_type = f"HYBRID (required={len(required_tags)} AND, optional={len(optional_tags)} OR)"
+            elif all_required and use_hybrid:
+                # All tags are required - auto-AND mode
+                match_type = "ALL (auto-AND for required tags)"
+            else:
+                match_type = "ALL" if match_all else "ANY"
 
             return {
                 "memories": results,
                 "tags": tags,
                 "match_type": match_type,
-                "count": len(results)
+                "count": len(results),
+                "hybrid_mode": use_hybrid_search
             }
 
         except Exception as e:
